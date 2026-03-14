@@ -1,6 +1,9 @@
 # Build
 target/
 
+# Test snapshots (generated)
+**/test_snapshots/
+
 # IDE
 .idea/
 .vscode/

@@ -4,9 +4,7 @@
 //! - SME receives stablecoin when funding target is met
 //! - Investors receive principal + yield when buyer pays at maturity
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +51,9 @@ impl LiquifactEscrow {
             maturity,
             status: 0, // open
         };
-        env.storage().instance().set(&symbol_short!("escrow"), &escrow);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
         escrow
     }
 
@@ -73,16 +73,23 @@ impl LiquifactEscrow {
         if escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1; // funded - ready to release to SME
         }
-        env.storage().instance().set(&symbol_short!("escrow"), &escrow);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
         escrow
     }
 
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     pub fn settle(env: Env) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
-        assert!(escrow.status == 1, "Escrow must be funded before settlement");
+        assert!(
+            escrow.status == 1,
+            "Escrow must be funded before settlement"
+        );
         escrow.status = 2; // settled
-        env.storage().instance().set(&symbol_short!("escrow"), &escrow);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
         escrow
     }
 }
