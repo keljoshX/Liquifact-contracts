@@ -23,7 +23,7 @@ pub struct InvoiceEscrow {
     pub yield_bps: i64,
     /// Maturity timestamp (ledger time)
     pub maturity: u64,
-    /// Escrow status: 0 = open, 1 = funded, 2 = settled
+    /// Escrow status: 0 = open, 1 = funded, 2 = payment_confirmed, 3 = settled
     pub status: u32,
 }
 
@@ -79,14 +79,34 @@ impl LiquifactEscrow {
         escrow
     }
 
+    /// Confirm buyer payment.
+    ///
+    /// This is a critical step in the settlement sequence. Before settlement can be finalized,
+    /// the buyer's payment must be explicitly confirmed. This ensures that funds are not released
+    /// to investors until the invoice has been verifiably repaid.
+    ///
+    /// The sequence is as follows:
+    /// 1. `fund`: Investors fund the escrow until the target is met (status -> 1).
+    /// 2. `confirm_payment`: An authorized party confirms the buyer has paid (status -> 2).
+    /// 3. `settle`: The escrow is settled, and funds are released (status -> 3).
+    pub fn confirm_payment(env: Env) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone());
+        assert!(escrow.status == 1, "Escrow not funded");
+        escrow.status = 2; // payment_confirmed
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
+        escrow
+    }
+
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     pub fn settle(env: Env) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
         assert!(
-            escrow.status == 1,
-            "Escrow must be funded before settlement"
+            escrow.status == 2,
+            "Buyer payment not confirmed"
         );
-        escrow.status = 2; // settled
+        escrow.status = 3; // settled
         env.storage()
             .instance()
             .set(&symbol_short!("escrow"), &escrow);

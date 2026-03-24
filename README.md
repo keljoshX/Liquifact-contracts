@@ -67,8 +67,21 @@ liquifact-contracts/
 
 - **init** — Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity).
 - **get_escrow** — Read current escrow state.
-- **fund** — Record investor funding; status becomes “funded” when target is met.
-- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **fund** — Record investor funding; status becomes “funded” (1) when target is met.
+- **confirm_payment** — Explicitly confirm buyer has paid (2). This is required before settlement.
+- **settle** — Finalize settlement (3) and release principal + yield to investors.
+
+---
+
+## Settlement Sequence
+
+To ensure secure and verifiable fund release, the escrow contract follows a strict sequence:
+
+1. **Funding Phase**: Investors contribute until `funding_target` is reached. Status moves to `1` (Funded).
+2. **Confirmation Phase**: Once the invoice reaches maturity and the buyer pays, an authorized entity calls `confirm_payment`. Status moves to `2` (Payment Confirmed).
+3. **Settlement Phase**: The final `settle` call can then be made to finalize the escrow. Status moves to `3` (Settled).
+
+Replay protection: `confirm_payment` and `settle` are idempotent-guarded by status checks, preventing double-confirmations or premature settlements.
 
 ---
 
