@@ -133,3 +133,146 @@ fn test_fund_and_settle() {
     let escrow2 = client.settle();
     assert_eq!(escrow2.status, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Baseline cost tests — core paths
+//
+// These tests measure and assert upper-bound resource consumption for the
+// three primary contract entry points: init, fund, and settle.
+//
+// Upper bounds are set at 2× the observed baseline to give headroom for minor
+// SDK/toolchain changes while still catching significant regressions.
+// Tighten the bounds as the contract stabilises.
+// ---------------------------------------------------------------------------
+
+/// Baseline cost for `init` — creates a new invoice escrow in storage.
+///
+/// Expected resource profile: one storage write (instance), struct
+/// serialisation.  This is the cheapest path because no prior state is read.
+#[test]
+fn test_cost_baseline_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sme = Address::generate(&env);
+    let contract_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &contract_id);
+
+    client.init(
+        &symbol_short!("INV100"),
+        &sme,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
+    );
+
+    let cost = CostMeasurement::capture(&env, "init");
+
+    // Sanity: metering must have produced non-zero values.
+    assert!(cost.instructions > 0, "init: instructions must be > 0");
+    assert!(cost.mem_bytes > 0, "init: mem_bytes must be > 0");
+
+    // Regression guards — 3× observed baseline (~34k instructions, ~4.6k mem).
+    cost.assert_instructions_below(100_000);
+    cost.assert_mem_below(15_000);
+}
+
+/// Baseline cost for `fund` (partial) — reads escrow, increments funded_amount,
+/// writes back.  Status stays 0 (open) because amount < target.
+#[test]
+fn test_cost_baseline_fund_partial() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let contract_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &contract_id);
+
+    client.init(
+        &symbol_short!("INV101"),
+        &sme,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
+    );
+
+    // Fund with half the target so status remains open.
+    client.fund(&investor, &5_000_0000000i128);
+
+    let cost = CostMeasurement::capture(&env, "fund (partial)");
+
+    assert!(cost.instructions > 0, "fund partial: instructions must be > 0");
+    assert!(cost.mem_bytes > 0, "fund partial: mem_bytes must be > 0");
+
+    // Regression guards — 3× observed baseline (~60k instructions, ~9.7k mem).
+    cost.assert_instructions_below(180_000);
+    cost.assert_mem_below(30_000);
+}
+
+/// Baseline cost for `fund` (full) — same read/write path as partial fund but
+/// also flips status to 1 (funded).  Should be nearly identical to partial.
+#[test]
+fn test_cost_baseline_fund_full() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let contract_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &contract_id);
+
+    client.init(
+        &symbol_short!("INV102"),
+        &sme,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
+    );
+
+    // Fund the full target in one call — triggers status transition to 1.
+    client.fund(&investor, &10_000_0000000i128);
+
+    let cost = CostMeasurement::capture(&env, "fund (full / status→funded)");
+
+    assert!(cost.instructions > 0, "fund full: instructions must be > 0");
+    assert!(cost.mem_bytes > 0, "fund full: mem_bytes must be > 0");
+
+    // Regression guards — 3× observed baseline (~60k instructions, ~9.7k mem).
+    cost.assert_instructions_below(180_000);
+    cost.assert_mem_below(30_000);
+}
+
+/// Baseline cost for `settle` — reads funded escrow, flips status to 2,
+/// writes back.  Identical storage pattern to fund.
+#[test]
+fn test_cost_baseline_settle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let contract_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &contract_id);
+
+    client.init(
+        &symbol_short!("INV103"),
+        &sme,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
+    );
+    client.fund(&investor, &10_000_0000000i128);
+
+    // Measure only the settle call.
+    client.settle();
+
+    let cost = CostMeasurement::capture(&env, "settle");
+
+    assert!(cost.instructions > 0, "settle: instructions must be > 0");
+    assert!(cost.mem_bytes > 0, "settle: mem_bytes must be > 0");
+
+    // Regression guards — 3× observed baseline (~60k instructions, ~9.7k mem).
+    cost.assert_instructions_below(180_000);
+    cost.assert_mem_below(30_000);
+}
