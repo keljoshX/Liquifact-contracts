@@ -27,128 +27,34 @@ cargo test
 
 ## Development
 
-| Command                      | Description                    |
-|------------------------------|--------------------------------|
-| `cargo build`                | Build all contracts            |
-| `cargo test`                 | Run unit tests                 |
-| `cargo fmt`                  | Format code                    |
-| `cargo fmt -- --check`       | Check formatting (CI)          |
+| Command                | Description                                                |
+|------------------------|------------------------------------------------------------|
+| `cargo build`          | Build all contracts                                        |
+| `cargo test`           | Run unit tests and property-based tests (using `proptest`) |
+| `cargo fmt`            | Format code                                                |
+| `cargo fmt -- --check` | Check formatting (used in CI)                              |
 
 ---
 
 ## Project structure
 
-```
+```text
 liquifact-contracts/
-├── Cargo.toml                  # Workspace definition
+├── Cargo.toml              # Workspace definition
+├── docs/
+│   └── EVENT_SCHEMA.md    # Indexer-friendly event schema reference
 ├── escrow/
-│   ├── Cargo.toml              # Escrow contract crate
+│   ├── Cargo.toml          # Escrow contract crate
 │   └── src/
-│       ├── lib.rs              # Contract implementation + interface spec
-│       └── test.rs             # Full test suite (16 tests)
+│       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle, migrate)
+│       └── test.rs      # Unit tests
+├── docs/
+│   ├── openapi.yaml     # OpenAPI 3.1 specification
+│   ├── package.json     # Test runner deps (AJV, js-yaml)
+│   └── tests/
+│       └── openapi.test.js  # Schema conformance tests (51 cases)
 └── .github/workflows/
-    └── ci.yml                  # CI: fmt, build, test
-```
-
----
-
-## Escrow Contract — Interface Specification
-
-### Overview
-
-The escrow contract holds investor stablecoin funds for a single tokenized invoice.
-Deploy **one contract instance per invoice**.
-
-### Lifecycle state machine
-
-```
-[open] ──fund()──► [funded] ──settle()──► [settled]
-  0                    1                      2
-```
-
-| Status | Name    | Meaning                                              |
-|--------|---------|------------------------------------------------------|
-| `0`    | open    | Accepting investor contributions                     |
-| `1`    | funded  | Funding target met; SME can receive liquidity        |
-| `2`    | settled | Buyer paid; investors may redeem principal + yield   |
-
-### Data type: `InvoiceEscrow`
-
-Stored in contract instance storage under key `"escrow"`.
-
-| Field            | Type      | Description                                                        |
-|------------------|-----------|--------------------------------------------------------------------|
-| `invoice_id`     | `Symbol`  | Unique invoice ID (≤ 9 bytes, e.g. `INV-1023`)                    |
-| `sme_address`    | `Address` | SME (seller) Stellar address                                       |
-| `amount`         | `i128`    | Invoice face value in smallest stablecoin unit; immutable          |
-| `funding_target` | `i128`    | Minimum investment to release funds; initialized to `amount`       |
-| `funded_amount`  | `i128`    | Running total of investor contributions; starts at `0`             |
-| `yield_bps`      | `i64`     | Annualized yield in basis points (800 = 8.00% p.a.)               |
-| `maturity`       | `u64`     | Invoice maturity as ledger timestamp (Unix seconds)                |
-| `status`         | `u32`     | Lifecycle status: `0` open · `1` funded · `2` settled             |
-
----
-
-### Method: `init`
-
-```rust
-pub fn init(
-    env: Env,
-    invoice_id: Symbol,
-    sme_address: Address,
-    amount: i128,
-    yield_bps: i64,
-    maturity: u64,
-) -> InvoiceEscrow
-```
-
-Creates and persists a new escrow. Must be called once before any other method.
-
-**Parameters**
-
-| Parameter     | Constraints                                      |
-|---------------|--------------------------------------------------|
-| `invoice_id`  | Non-empty Symbol; ≤ 9 bytes; unique per SME      |
-| `sme_address` | Valid Stellar account or contract address        |
-| `amount`      | > 0; face value in smallest stablecoin unit      |
-| `yield_bps`   | ≥ 0; annualized yield in basis points            |
-| `maturity`    | Ledger timestamp; should be > current ledger time|
-
-**Returns** — `InvoiceEscrow` with `funded_amount = 0`, `status = 0`.
-
-**Failure conditions**
-
-| Condition              | Behaviour                                    |
-|------------------------|----------------------------------------------|
-| Called a second time   | Silently overwrites existing escrow state    |
-| `amount <= 0`          | No runtime guard; caller's responsibility    |
-
-**State transition** — `(none)` → `status = 0`
-
----
-
-### Method: `get_escrow`
-
-```rust
-pub fn get_escrow(env: Env) -> InvoiceEscrow
-```
-
-Read-only view of current escrow state. Does not modify storage.
-
-**Returns** — Clone of the stored `InvoiceEscrow`.
-
-**Failure conditions**
-
-| Condition           | Behaviour                          |
-|---------------------|------------------------------------|
-| `init` not called   | Panics: `"Escrow not initialized"` |
-
----
-
-### Method: `fund`
-
-```rust
-pub fn fund(env: Env, _investor: Address, amount: i128) -> InvoiceEscrow
+    └── ci.yml              # CI: fmt, build, test
 ```
 
 Records an investor contribution. Transitions to `status = 1` when
@@ -176,79 +82,93 @@ Records an investor contribution. Transitions to `status = 1` when
 
 **State transitions**
 
-- `status 0` → `status 0` while `funded_amount < funding_target`
-- `status 0` → `status 1` when `funded_amount >= funding_target`
+- **init** — Create an invoice escrow (invoice id, SME address, admin address, amount, yield bps, maturity).
+- **get_escrow** — Read current escrow state.
+- **get_version** — Return the stored schema version number.
+- **fund** — Record investor funding; status becomes "funded" when target is met.
+- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **migrate** — Upgrade storage from an older schema version to the current one (see below).
 
 ---
 
-### Method: `settle`
+## Contract migration strategy
 
-```rust
-pub fn settle(env: Env) -> InvoiceEscrow
+### Overview
+
+The escrow contract stores its state as a single [`InvoiceEscrow`](escrow/src/lib.rs) struct under the instance storage key `"escrow"`, alongside a `"version"` key that holds the current schema version (`u32`).
+
+Any change to the struct layout (adding, removing, or retyping a field) is a **breaking schema change** and requires a version bump and a migration path.
+
+### Version history
+
+| Version | Description |
+|---------|-------------|
+| 1       | Initial schema — `invoice_id`, `sme_address`, `amount`, `funding_target`, `funded_amount`, `yield_bps`, `maturity`, `status`, `version` |
+
+### How versioning works
+
+- `SCHEMA_VERSION` in `lib.rs` is the source of truth for the current schema.
+- Every `init` call writes `SCHEMA_VERSION` into both the struct's `version` field and the `"version"` storage key.
+- `get_version()` lets off-chain tooling (indexers, upgrade scripts) read the stored version before deciding whether to call `migrate`.
+
+### Adding a new schema version (step-by-step)
+
+1. **Bump `SCHEMA_VERSION`** in `lib.rs` (e.g. `1` to `2`).
+2. **Keep the old struct** — add a `legacy` module (or a type alias like `InvoiceEscrowV1`) so the old bytes can still be deserialized.
+3. **Add a migration arm** in `LiquifactEscrow::migrate`:
+   ```rust
+   if from_version == 1 {
+       let old: InvoiceEscrowV1 = env.storage().instance()
+           .get(&symbol_short!("escrow")).unwrap();
+       let new = InvoiceEscrow {
+           // spread old fields, default new ones
+           new_field: default_value,
+           version: 2,
+           ..old.into()
+       };
+       env.storage().instance().set(&symbol_short!("escrow"), &new);
+       env.storage().instance().set(&symbol_short!("version"), &2u32);
+   }
+   ```
+4. **Write a test** in `test.rs` that manually writes the old struct bytes into storage and asserts the migrated state is correct.
+5. **Gate `migrate` behind admin auth** before deploying to production (see security notes below).
+
+### Deployment upgrade flow
+
+```
+1. Deploy new WASM (bump SCHEMA_VERSION, add migration arm)
+2. Call get_version()  ->  confirm stored version == N
+3. Call migrate(N)     ->  storage upgraded to N+1
+4. Call get_version()  ->  confirm stored version == N+1
+5. Resume normal operations
 ```
 
-Marks the escrow as settled (buyer has paid). Investors are entitled to
-`principal + (principal × yield_bps / 10_000)` after this point.
+The contract rejects `migrate` calls that:
+- Pass a `from_version` that does not match the stored version (prevents accidental double-migration).
+- Pass a `from_version >= SCHEMA_VERSION` (already up to date).
 
-> **Production note:** Should be callable only by an authorized oracle or
-> multi-sig. This version trusts any caller.
+### Security notes
 
-**Returns** — Updated `InvoiceEscrow` with `status = 2`.
-
-**Failure conditions**
-
-| Condition         | Behaviour                                           |
-|-------------------|-----------------------------------------------------|
-| `status != 1`     | Panics: `"Escrow must be funded before settlement"` |
-| `init` not called | Panics: `"Escrow not initialized"`                  |
-
-**State transition** — `status 1` → `status 2`
+- **Re-initialization guard** — `init` panics if the escrow is already initialized, preventing state overwrite.
+- **`migrate` must be admin-gated in production** — the current implementation is open for testability. Before mainnet deployment, add `admin_address.require_auth()` at the top of `migrate` so only the contract deployer can trigger upgrades.
+- **No silent data loss** — migration arms must explicitly handle every field. Defaulting a field to zero/false is intentional and must be documented in the version history table above.
+- **Immutable history** — old migration arms should never be removed; they ensure any instance at any historical version can be brought forward step-by-step.
 
 ---
 
-### Yield calculation (off-chain reference)
+## Security & Authorization
 
-```
-investor_return = principal + floor(principal × yield_bps / 10_000)
-```
+Currently, the contract methods (`init`, `fund`, `settle`) **do not enforce authorization** via `require_auth()`. They rely solely on state-machine guards (e.g. checking if `status == 0` before funding).
 
-Example: 10,000 USDC at 800 bps (8%) → return = 10,800 USDC.
+> **Warning:** This represents an authentication gap. Any caller can trigger these functions. Negative tests have been added to track this gap and ensure proper exceptions are thrown when the contract is in an invalid state.
 
 ---
 
-## Security Notes
 
-- **Token custody** — `fund()` does not move tokens. A production integration
-  must pair each call with a SEP-41 `transfer` in the same transaction.
-- **Settlement authorization** — `settle()` has no access control in this
-  version. Add an `admin: Address` field and `admin.require_auth()` before
-  deploying to mainnet.
-- **Re-initialization** — Calling `init()` twice overwrites state. Guard with
-  a storage existence check if re-initialization must be prevented.
-- **Integer overflow** — `funded_amount` accumulates `i128` values. Overflow
-  is unreachable in practice (max i128 ≈ 1.7 × 10³⁸) but release builds wrap
-  silently; use `checked_add` for defense-in-depth.
-- **Maturity enforcement** — The contract does not enforce `maturity` on-chain.
-  Time-based guards should be added via `env.ledger().timestamp()` comparisons.
-
----
-
-## Test coverage
-
-16 tests covering the full lifecycle, all failure conditions, and edge cases.
-
-| Category              | Tests |
-|-----------------------|-------|
-| Happy-path lifecycle  | 5     |
-| Field integrity       | 3     |
-| Edge cases            | 2     |
-| Panic / failure paths | 6     |
-
-Run with:
-
-```bash
-cargo test
-```
+## Funding Constraints
+- **Minimum Funding:** All funding amounts must be strictly greater than zero ($> 0$). 
+- **Initialization:** Escrow creation will fail if the target amount is not positive.
+- **Integer Safety:** Uses `checked_add` to prevent overflow during funded amount accounting.
 
 ---
 
@@ -256,22 +176,50 @@ cargo test
 
 GitHub Actions runs on every push and pull request to `main`:
 
-- **Format** — `cargo fmt --all -- --check`
-- **Build** — `cargo build`
-- **Tests** — `cargo test`
+| Step | Command | Fails if… |
+|------|---------|-----------|
+| Format | `cargo fmt --all -- --check` | any file is not formatted |
+| Build | `cargo build` | compilation error |
+| Tests | `cargo test` | any test fails |
+| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95 % |
+
+### Coverage gate
+
+The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (installed via `taiki-e/install-action`) to measure line coverage and hard-fail the job when it drops below **95 %**.
+
+To run the coverage check locally:
+
+```bash
+# Install once
+cargo install cargo-llvm-cov
+
+# Run (requires llvm-tools-preview component)
+rustup component add llvm-tools-preview
+cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only
+```
+
+Keep formatting, tests, and coverage passing before opening a PR.
 
 ---
 
 ## Contributing
 
-1. Fork the repo and clone your fork.
-2. Create a branch from `main`: `git checkout -b feature/your-feature`.
-3. Follow existing patterns in `escrow/src/lib.rs`.
-4. Add or update tests in `escrow/src/test.rs`.
-5. Format with `cargo fmt`.
-6. Verify: `cargo fmt --all -- --check && cargo build && cargo test`.
-7. Commit with clear messages (e.g. `feat(escrow): X`, `test(escrow): Y`).
-8. Push and open a Pull Request to `main`.
+1. **Fork** the repo and clone your fork.
+2. **Create a branch** from `main`: `git checkout -b feature/your-feature` or `fix/your-fix`.
+3. **Setup**: ensure Rust stable is installed; run `cargo build` and `cargo test`.
+4. **Make changes**:
+   - Follow existing patterns in `escrow/src/lib.rs`.
+   - Add or update tests in `escrow/src/test.rs`.
+   - Format with `cargo fmt`.
+5. **Verify locally**:
+   - `cargo fmt --all -- --check`
+   - `cargo build`
+   - `cargo test`
+6. **Commit** with clear messages (e.g. `feat(escrow): X`, `test(escrow): Y`).
+7. **Push** to your fork and open a **Pull Request** to `main`.
+8. Wait for CI and address review feedback.
+
+We welcome new contracts (e.g. settlement, tokenization helpers), tests, and docs that align with LiquiFact's invoice financing flow.
 
 ---
 

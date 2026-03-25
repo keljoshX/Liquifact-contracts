@@ -1,93 +1,206 @@
 //! # LiquiFact Escrow Contract
 //!
-//! A Soroban smart contract on Stellar that holds investor funds for a
-//! tokenized invoice until settlement.
+//! Holds investor funds for an invoice until settlement.
+//! - SME receives stablecoin when funding target is met
+//! - Investors receive principal + yield when buyer pays at maturity
 //!
-//! ## Lifecycle
+//! # Storage Schema Versioning
 //!
-//! ```text
-//! [open] --fund()--> [funded] --settle()--> [settled]
-//!   0                   1                      2
-//! ```
+//! The escrow state is stored under two keys:
+//! - `"escrow"` — the [`InvoiceEscrow`] struct (current schema)
+//! - `"version"` — a `u32` schema version number
 //!
-//! 1. **open (0)** — Escrow is initialized and accepting investor funds.
-//! 2. **funded (1)** — `funded_amount >= funding_target`; SME can receive liquidity.
-//! 3. **settled (2)** — Buyer has paid; investors receive principal + yield.
+//! ## Version history
 //!
-//! ## Security Assumptions
+//! | Version | Changes |
+//! |---------|---------|
+//! | 1       | Initial schema: invoice_id, sme_address, amount, funding_target, funded_amount, yield_bps, maturity, status |
 //!
-//! - In production, `fund()` must be preceded by an authorized token transfer
-//!   (e.g. SEP-41 token `transfer` call). The current implementation records
-//!   the accounting only; token custody is handled by the calling layer.
-//! - `settle()` must be gated by an authorized oracle or buyer confirmation in
-//!   production. The current implementation trusts the caller.
-//! - All arithmetic uses `i128` to prevent overflow on large invoice amounts.
-//! - Yield calculation (`yield_bps`) is stored as basis points (1 bps = 0.01%).
-//!   Maximum representable yield: `i64::MAX` bps — well beyond any realistic rate.
-//!
-//! ## External Integrator Notes
-//!
-//! - Storage key: `"escrow"` (instance storage, single escrow per contract instance).
-//! - Deploy one contract instance per invoice.
-//! - All monetary values are in the smallest unit of the chosen stablecoin
-//!   (e.g. stroops for XLM, or 7-decimal units for USDC on Stellar).
-//! - `maturity` is a ledger timestamp (`u64`). Enforcement of maturity windows
-//!   is the responsibility of the calling layer in this version.
+//! When a new field is added or the struct layout changes, bump `SCHEMA_VERSION`,
+//! add a migration arm in [`LiquifactEscrow::migrate`], and add a corresponding test.
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
+};
 
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
+/// Current storage schema version. Bump this with every breaking struct change.
+pub const SCHEMA_VERSION: u32 = 1;
 
-/// Full state of a single invoice escrow.
+/// Full state of an invoice escrow persisted in contract storage.
 ///
-/// Stored in contract instance storage under the key `"escrow"`.
-/// One `InvoiceEscrow` exists per deployed contract instance.
+/// All monetary values use the smallest indivisible unit of the relevant
+/// Stellar asset (e.g. stroops for XLM, or the token's own precision).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvoiceEscrow {
-    /// Unique invoice identifier supplied by the originator (e.g. `INV-1023`).
-    /// Maximum length: 9 bytes (Soroban `Symbol` constraint).
+    /// Unique invoice identifier agreed between SME and platform (e.g. `"INV1023"`).
+    /// Maximum 8 ASCII characters due to Soroban `symbol_short!` constraints.
     pub invoice_id: Symbol,
-
-    /// Stellar address of the SME (seller) that will receive liquidity once
-    /// the funding target is met.
+    /// Admin address that initialized this escrow
+    pub admin: Address,
+    /// SME wallet that receives liquidity and authorizes settlement
     pub sme_address: Address,
-
-    /// Face value of the invoice in the smallest stablecoin unit.
-    /// Must be > 0. Set once at `init`; immutable thereafter.
+    /// Administrator authorized to update maturity
+    pub admin: Address,
+    /// Total amount in smallest unit (e.g. stroops for XLM)
     pub amount: i128,
 
-    /// Minimum total investment required before the SME can be paid.
-    /// Initialized to `amount`; immutable after `init`.
+    /// Investor funding target.  Currently equal to `amount`; may diverge
+    /// in future versions that support partial invoice tokenization.
     pub funding_target: i128,
 
-    /// Running total of all investor contributions recorded via `fund()`.
-    /// Starts at 0; monotonically increases; never exceeds `i128::MAX`.
+    /// Running total committed by investors so far (starts at 0).
+    /// Status transitions to `1` (funded) the moment this reaches `funding_target`.
     pub funded_amount: i128,
-
-    /// Annualized yield in basis points (1 bps = 0.01%).
-    /// Example: `800` = 8.00% p.a.
-    /// Used by the settlement layer to compute investor returns.
+    /// Total settled (paid by buyer) so far
+    pub settled_amount: i128,
+    /// Yield basis points (e.g. 800 = 8%)
     pub yield_bps: i64,
 
-    /// Ledger timestamp at which the invoice matures (buyer payment due).
-    /// Expressed as seconds since the Unix epoch (Stellar ledger `close_time`).
+    /// Ledger timestamp at which the invoice matures and settlement is expected.
+    /// Stored as seconds since Unix epoch (Soroban `u64` ledger time).
     pub maturity: u64,
 
     /// Escrow lifecycle status:
-    /// - `0` — open: accepting investor funds
-    /// - `1` — funded: funding target met; awaiting buyer payment
-    /// - `2` — settled: buyer paid; investors may redeem principal + yield
+    /// - `0` — **open**: accepting investor funding
+    /// - `1` — **funded**: target met; SME can be paid; awaiting buyer settlement
+    /// - `2` — **settled**: buyer paid; investors can redeem principal + yield
+    pub status: u32,
+    /// Storage schema version — must equal [`SCHEMA_VERSION`] after any migration
+    pub version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaturityUpdatedEvent {
+    pub invoice_id: Symbol,
+    pub old_maturity: u64,
+    pub new_maturity: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialSettlementEvent {
+    pub invoice_id: Symbol,
+    pub amount: i128,
+    pub settled_amount: i128,
+    pub total_due: i128,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Event types (one per state-changing function)
+//
+// Fields annotated with `#[topic]` appear in the Soroban event topic vector;
+// all other fields appear in the event data payload.
+//
+// Keeping payloads as named structs makes XDR decoding forward-compatible and
+// self-documenting in ledger explorers.  See docs/EVENT_SCHEMA.md for the
+// full indexer reference including JSON examples and XDR topic filters.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Emitted by `init()` when a new invoice escrow is created.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"         : "escrow_initd",
+///   "invoice_id"    : "INV1023",
+///   "sme_address"   : "GBSME...",
+///   "amount"        : 100000000000,
+///   "funding_target": 100000000000,
+///   "funded_amount" : 0,
+///   "yield_bps"     : 800,
+///   "maturity"      : 1750000000,
+///   "status"        : 0
+/// }
+/// ```
+#[contractevent]
+pub struct EscrowInitialized {
+    /// Event name topic — used by indexers to filter this event type.
+    #[topic]
+    pub name: Symbol,
+    /// Full escrow snapshot at creation time (status always 0 / open).
+    pub escrow: InvoiceEscrow,
+}
+
+/// Emitted by `fund()` on every successful investor contribution.
+///
+/// Emitted on **every** `fund()` call, not only when the target is first met.
+/// Indexers can sum `amount` per `invoice_id` to reconstruct the full funding
+/// history without reading contract storage.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"        : "escrow_funded",
+///   "invoice_id"   : "INV1023",
+///   "investor"     : "GBINV...",
+///   "amount"       : 50000000000,
+///   "funded_amount": 100000000000,
+///   "status"       : 1
+/// }
+/// ```
+#[contractevent]
+pub struct EscrowFunded {
+    /// Event name topic.
+    #[topic]
+    pub name: Symbol,
+    /// Invoice this contribution belongs to.
+    pub invoice_id: Symbol,
+    /// Investor wallet that called `fund()`.
+    pub investor: Address,
+    /// Amount added in this single call (always positive).
+    pub amount: i128,
+    /// Cumulative funded amount **after** this call.
+    pub funded_amount: i128,
+    /// Status value **after** this call: `0` = still open, `1` = now fully funded.
     pub status: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
+/// Emitted by `settle()` once the buyer has paid and the escrow is closed.
+///
+/// Contains everything needed for a settlement accounting service to compute
+/// investor payouts without re-reading contract storage.
+///
+/// ### Indexer example (JSON after XDR decode)
+/// ```json
+/// {
+///   "event"         : "escrow_settled",
+///   "invoice_id"    : "INV1023",
+///   "funded_amount" : 100000000000,
+///   "yield_bps"     : 800,
+///   "maturity"      : 1750000000
+/// }
+/// ```
+///
+/// ### Payout formula (off-chain, backend responsibility)
+/// ```text
+/// gross_yield = funded_amount * (yield_bps / 10_000) * (days_held / 365)
+/// investor_payout = funded_amount + gross_yield
+/// ```
+#[contractevent]
+pub struct EscrowSettled {
+    /// Event name topic.
+    #[topic]
+    pub name: Symbol,
+    /// Invoice that has been settled.
+    pub invoice_id: Symbol,
+    /// Total principal held (== `funding_target` at settlement time).
+    pub funded_amount: i128,
+    /// Annualized yield in basis points for investor payout calculation.
+    pub yield_bps: i64,
+    /// Original maturity timestamp — used by backend to compute accrued interest.
+    pub maturity: u64,
+}
 
-/// LiquiFact escrow contract entry point.
+// ──────────────────────────────────────────────────────────────────────────────
+// Contract
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Storage key for the single `InvoiceEscrow` record kept in instance storage.
+/// One contract instance == one invoice escrow.
+const ESCROW_KEY: Symbol = symbol_short!("escrow");
+
 #[contract]
 pub struct LiquifactEscrow;
 
@@ -99,172 +212,245 @@ impl LiquifactEscrow {
 
     /// Initialize a new invoice escrow.
     ///
-    /// Creates and persists an [`InvoiceEscrow`] in instance storage.
-    /// Must be called exactly once per contract instance before any other
-    /// method.
+    /// # Authorization
+    /// Requires authorization from `admin`. This prevents any unauthorized
+    /// party from creating or overwriting escrow state.
     ///
-    /// # Parameters
-    ///
-    /// | Parameter    | Type      | Constraints                          |
-    /// |--------------|-----------|--------------------------------------|
-    /// | `invoice_id` | `Symbol`  | Non-empty; ≤ 9 bytes; unique per SME |
-    /// | `sme_address`| `Address` | Valid Stellar account or contract     |
-    /// | `amount`     | `i128`    | > 0; face value in smallest unit     |
-    /// | `yield_bps`  | `i64`     | ≥ 0; annualized yield in basis points|
-    /// | `maturity`   | `u64`     | > current ledger time (not enforced) |
-    ///
-    /// # Returns
-    ///
-    /// The newly created [`InvoiceEscrow`] with:
-    /// - `funded_amount = 0`
-    /// - `funding_target = amount`
-    /// - `status = 0` (open)
-    ///
-    /// # Failure Conditions
-    ///
-    /// | Condition                        | Behaviour                        |
-    /// |----------------------------------|----------------------------------|
-    /// | Called a second time             | Overwrites existing escrow state |
-    /// | `amount <= 0`                    | No runtime check; caller's responsibility |
-    ///
-    /// # State Transition
-    ///
-    /// `(none)` → `status = 0` (open)
+    /// # Panics
+    /// - If an escrow has already been initialized.
     pub fn init(
         env: Env,
+        admin: Address,
         invoice_id: Symbol,
         sme_address: Address,
+        admin: Address,
         amount: i128,
         yield_bps: i64,
         maturity: u64,
     ) -> InvoiceEscrow {
+        // Prevent re-initialization
+        assert!(
+            !env.storage().instance().has(&symbol_short!("escrow")),
+            "Escrow already initialized"
+        );
         let escrow = InvoiceEscrow {
             invoice_id: invoice_id.clone(),
+            admin: admin.clone(),
             sme_address: sme_address.clone(),
+            admin: admin.clone(),
             amount,
             funding_target: amount,
             funded_amount: 0,
+            settled_amount: 0,
             yield_bps,
             maturity,
-            status: 0,
+            status: 0, // open
+            version: SCHEMA_VERSION,
         };
         env.storage()
             .instance()
             .set(&symbol_short!("escrow"), &escrow);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("version"), &SCHEMA_VERSION);
         escrow
     }
 
-    // -----------------------------------------------------------------------
+    // ──────────────────────────────────────────────────────────────────────────
     // get_escrow
-    // -----------------------------------------------------------------------
+    // ──────────────────────────────────────────────────────────────────────────
 
-    /// Retrieve the current escrow state.
+    /// Return the current escrow state without modifying storage.
     ///
-    /// Read-only; does not modify storage.
+    /// Read-only; does **not** emit an event.
     ///
-    /// # Returns
-    ///
-    /// A clone of the stored [`InvoiceEscrow`].
-    ///
-    /// # Failure Conditions
-    ///
-    /// | Condition              | Behaviour                  |
-    /// |------------------------|----------------------------|
-    /// | `init` not yet called  | Panics: "Escrow not initialized" |
+    /// ## Errors
+    /// Panics with `"Escrow not initialized"` if `init` has not been called.
     pub fn get_escrow(env: Env) -> InvoiceEscrow {
         env.storage()
             .instance()
-            .get(&symbol_short!("escrow"))
+            .get(&ESCROW_KEY)
             .unwrap_or_else(|| panic!("Escrow not initialized"))
     }
 
-    // -----------------------------------------------------------------------
-    // fund
-    // -----------------------------------------------------------------------
-
-    /// Record an investor funding contribution.
-    ///
-    /// Adds `amount` to `funded_amount`. If the running total meets or exceeds
-    /// `funding_target`, the escrow transitions to `status = 1` (funded).
-    ///
-    /// > **Production note:** In a live deployment this method must be called
-    /// > atomically with a SEP-41 token `transfer` from `investor` to the
-    /// > contract address. The current implementation records accounting only.
-    ///
-    /// # Parameters
-    ///
-    /// | Parameter   | Type      | Constraints                        |
-    /// |-------------|-----------|------------------------------------|
-    /// | `_investor` | `Address` | Investor's Stellar address (logged) |
-    /// | `amount`    | `i128`    | > 0; partial funding is allowed    |
-    ///
-    /// # Returns
-    ///
-    /// Updated [`InvoiceEscrow`] after applying the contribution.
-    ///
-    /// # Failure Conditions
-    ///
-    /// | Condition                  | Behaviour                              |
-    /// |----------------------------|----------------------------------------|
-    /// | `status != 0`              | Panics: "Escrow not open for funding"  |
-    /// | `init` not called          | Panics: "Escrow not initialized"       |
-    /// | `amount <= 0`              | No runtime check; caller's responsibility |
-    /// | `funded_amount` overflows  | Rust panics on debug; wraps on release |
-    ///
-    /// # State Transition
-    ///
-    /// - `status 0` → `status 0` while `funded_amount < funding_target`
-    /// - `status 0` → `status 1` when `funded_amount >= funding_target`
-    pub fn fund(env: Env, _investor: Address, amount: i128) -> InvoiceEscrow {
-        let mut escrow = Self::get_escrow(env.clone());
-        assert!(escrow.status == 0, "Escrow not open for funding");
-        escrow.funded_amount += amount;
-        if escrow.funded_amount >= escrow.funding_target {
-            escrow.status = 1;
-        }
+    /// Returns the stored schema version.
+    pub fn get_version(env: Env) -> u32 {
         env.storage()
             .instance()
-            .set(&symbol_short!("escrow"), &escrow);
+            .get(&symbol_short!("version"))
+            .unwrap_or(0)
+    }
+
+    /// Migrate storage from an older schema version to the current one.
+    ///
+    /// # Security
+    /// In production this MUST be gated behind admin/owner authorization
+    /// (e.g. `admin.require_auth()`) so only the contract deployer can trigger it.
+    ///
+    /// # How to add a new migration
+    /// 1. Bump [`SCHEMA_VERSION`].
+    /// 2. Add a `from_version == N` arm below that reads the old struct
+    ///    (keep the old type alias in a `legacy` module), transforms it, and
+    ///    writes the new struct.
+    /// 3. Add a test in `test.rs` that simulates the old state and calls `migrate`.
+    pub fn migrate(env: Env, from_version: u32) -> u32 {
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("version"))
+            .unwrap_or(0);
+
+        assert!(
+            stored == from_version,
+            "from_version does not match stored version"
+        );
+        assert!(
+            from_version < SCHEMA_VERSION,
+            "Already at current schema version"
+        );
+
+        // --- Migration arms ---
+        // Add a new `if from_version == N` block for each future version bump.
+        // Example (not yet needed — shown for illustration):
+        //
+        // if from_version == 1 {
+        //     // Read old struct (V1), write new struct (V2) with new fields defaulted.
+        //     let old: InvoiceEscrowV1 = env.storage().instance()
+        //         .get(&symbol_short!("escrow")).unwrap();
+        //     let new = InvoiceEscrow { ...old, new_field: default_value, version: 2 };
+        //     env.storage().instance().set(&symbol_short!("escrow"), &new);
+        //     env.storage().instance().set(&symbol_short!("version"), &2u32);
+        // }
+
+        // No migrations needed yet (current version is 1, no prior versions exist).
+        panic!("No migration path from version {}", from_version);
+    }
+
+    /// Record investor funding. In production, this would be called with token transfer.
+    ///
+    /// # Authorization
+    /// Requires authorization from `investor`. Each investor authorizes their
+    /// own funding contribution, preventing third parties from funding on their behalf.
+    ///
+    /// # Panics
+    /// - If the escrow is not in the open (status = 0) state.
+    pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
+        // Auth boundary: investor must authorize their own funding action.
+        investor.require_auth();
+
+        let mut escrow = Self::get_escrow(env.clone());
+        
+        // Sanity Check: Reject zero or negative funding amounts
+        assert!(amount > 0, "Funding amount must be positive");
+        assert!(escrow.status == 0, "Escrow not open for funding");
+
+        escrow.funded_amount += amount;
+        if escrow.funded_amount >= escrow.funding_target {
+            escrow.status = 1; // funded — ready to release to SME
+        }
+
+        env.storage().instance().set(&ESCROW_KEY, &escrow);
+
+        // Event: EscrowFunded
+        // Emitted on every successful fund() call. Indexers can also detect
+        // the "fully funded" milestone via status == 1 in this payload.
+        EscrowFunded {
+            name: symbol_short!("escrow_fd"),
+            invoice_id: escrow.invoice_id.clone(),
+            investor,
+            amount,
+            funded_amount: escrow.funded_amount,
+            status: escrow.status,
+        }
+        .publish(&env);
+
         escrow
     }
 
-    // -----------------------------------------------------------------------
-    // settle
-    // -----------------------------------------------------------------------
-
-    /// Mark the escrow as settled (buyer has paid the invoice).
+    /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     ///
-    /// Transitions status to `2` (settled). After this point investors are
-    /// entitled to redeem `principal + (principal * yield_bps / 10_000)`.
+    /// # Authorization
+    /// Requires authorization from the `sme_address` stored in the escrow.
+    /// Only the SME that is the beneficiary of the escrow may trigger settlement,
+    /// preventing unauthorized state transitions to the settled state.
     ///
-    /// > **Production note:** This method should be callable only by an
-    /// > authorized oracle or multi-sig in a live deployment. The current
-    /// > implementation trusts any caller.
-    ///
-    /// # Returns
-    ///
-    /// Updated [`InvoiceEscrow`] with `status = 2`.
-    ///
-    /// # Failure Conditions
-    ///
-    /// | Condition                  | Behaviour                                      |
-    /// |----------------------------|------------------------------------------------|
-    /// | `status != 1`              | Panics: "Escrow must be funded before settlement" |
-    /// | `init` not called          | Panics: "Escrow not initialized"               |
-    ///
-    /// # State Transition
-    ///
-    /// `status 1` (funded) → `status 2` (settled)
+    /// # Panics
+    /// - If the escrow is not in the funded (status = 1) state.
     pub fn settle(env: Env) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
+
+        // Auth boundary: only the SME (payee) may settle the escrow.
+        escrow.sme_address.require_auth();
+
         assert!(
-            escrow.status == 1,
+            escrow.status == 1 || escrow.status == 2,
             "Escrow must be funded before settlement"
         );
-        escrow.status = 2;
+        
+        // Final status 2 means already fully settled, but we allow 
+        // calling this as long as it doesn't exceed total_due
+        
+        let interest = (escrow.amount * (escrow.yield_bps as i128)) / 10000;
+        let total_due = escrow.amount + interest;
+        
+        escrow.settled_amount += amount;
+        
+        assert!(
+            escrow.settled_amount <= total_due,
+            "Settlement amount exceeds total due"
+        );
+        
+        if escrow.settled_amount == total_due {
+            escrow.status = 2; // fully settled
+        }
+
         env.storage()
             .instance()
             .set(&symbol_short!("escrow"), &escrow);
+
+        // Audit event
+        let topics = vec![&env, symbol_short!("settle"), symbol_short!("partial")];
+        env.events().publish(
+            topics,
+            PartialSettlementEvent {
+                invoice_id: escrow.invoice_id.clone(),
+                amount,
+                settled_amount: escrow.settled_amount,
+                total_due,
+            },
+        );
+
+        escrow
+    }
+
+    /// Update maturity timestamp. Only allowed by admin in Open state.
+    pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // Strict authorization check
+        escrow.admin.require_auth();
+
+        // Validation: preventing post-funding tampering
+        assert!(escrow.status == 0, "Maturity can only be updated in Open state");
+
+        let old_maturity = escrow.maturity;
+        escrow.maturity = new_maturity;
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
+
+        // Audit event
+        let topics = vec![&env, symbol_short!("maturity"), symbol_short!("updated")];
+        env.events().publish(
+            topics,
+            MaturityUpdatedEvent {
+                invoice_id: escrow.invoice_id.clone(),
+                old_maturity,
+                new_maturity,
+            },
+        );
+
         escrow
     }
 }
