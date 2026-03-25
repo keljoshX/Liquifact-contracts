@@ -54,6 +54,148 @@ fn test_init_sets_version() {
         &800i64,
         &1000u64,
     );
+}
+
+/// Two separate ContractState instances are independent.
+#[test]
+fn test_init_with_admin_independent_states() {
+    let state_a = EscrowContract::init_with_admin(Address::from_string("GADMIN_A"));
+    let state_b = EscrowContract::init_with_admin(Address::from_string("GADMIN_B"));
+    assert_ne!(state_a.admin, state_b.admin);
+    assert!(!state_a.paused);
+    assert!(!state_b.paused);
+}
+
+// ===========================================================================
+// pause() tests  (Issue #24)
+// ===========================================================================
+
+/// Admin can pause an unpaused contract.
+#[test]
+fn test_pause_by_admin_succeeds() {
+    let mut state = unpaused_state();
+    EscrowContract::pause(&mut state, &make_admin());
+    assert!(state.paused, "contract must be paused after pause()");
+}
+
+/// is_paused() returns true immediately after pause.
+#[test]
+fn test_pause_is_reflected_in_is_paused() {
+    let mut state = unpaused_state();
+    EscrowContract::pause(&mut state, &make_admin());
+    assert!(EscrowContract::is_paused(&state));
+}
+
+/// Non-admin caller must be rejected.
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_pause_by_non_admin_panics() {
+    let mut state = unpaused_state();
+    EscrowContract::pause(&mut state, &make_other());
+}
+
+/// Pausing an already-paused contract must be rejected.
+#[test]
+#[should_panic(expected = "contract already paused")]
+fn test_pause_when_already_paused_panics() {
+    let mut state = paused_state();
+    EscrowContract::pause(&mut state, &make_admin());
+}
+
+/// Non-admin on already-paused: non-admin check fires first.
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_pause_non_admin_on_paused_contract_panics() {
+    let mut state = paused_state();
+    EscrowContract::pause(&mut state, &make_other());
+}
+
+// ===========================================================================
+// unpause() tests  (Issue #24)
+// ===========================================================================
+
+/// Admin can unpause a paused contract.
+#[test]
+fn test_unpause_by_admin_succeeds() {
+    let mut state = paused_state();
+    EscrowContract::unpause(&mut state, &make_admin());
+    assert!(!state.paused, "contract must be unpaused after unpause()");
+}
+
+/// is_paused() returns false after unpause.
+#[test]
+fn test_unpause_is_reflected_in_is_paused() {
+    let mut state = paused_state();
+    EscrowContract::unpause(&mut state, &make_admin());
+    assert!(!EscrowContract::is_paused(&state));
+}
+
+/// Non-admin caller must be rejected.
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_unpause_by_non_admin_panics() {
+    let mut state = paused_state();
+    EscrowContract::unpause(&mut state, &make_other());
+}
+
+/// Unpausing an already-unpaused contract must be rejected.
+#[test]
+#[should_panic(expected = "contract not paused")]
+fn test_unpause_when_not_paused_panics() {
+    let mut state = unpaused_state();
+    EscrowContract::unpause(&mut state, &make_admin());
+}
+
+// ===========================================================================
+// is_paused() tests  (Issue #24)
+// ===========================================================================
+
+#[test]
+fn test_is_paused_false_initially() {
+    let state = unpaused_state();
+    assert!(!EscrowContract::is_paused(&state));
+}
+
+#[test]
+fn test_is_paused_true_after_pause() {
+    let state = paused_state();
+    assert!(EscrowContract::is_paused(&state));
+}
+
+#[test]
+fn test_is_paused_false_after_unpause() {
+    let mut state = paused_state();
+    EscrowContract::unpause(&mut state, &make_admin());
+    assert!(!EscrowContract::is_paused(&state));
+}
+
+#[test]
+fn test_is_paused_does_not_mutate() {
+    let state = paused_state();
+    let _ = EscrowContract::is_paused(&state);
+    let _ = EscrowContract::is_paused(&state);
+    assert!(state.paused);
+}
+
+// ===========================================================================
+// fund() — pause guard tests  (Issue #24)
+// ===========================================================================
+
+#[test]
+#[should_panic(expected = "contract is paused")]
+fn test_fund_blocked_when_paused() {
+    let state = paused_state();
+    let mut escrow = default_escrow();
+    EscrowContract::fund(&state, &mut escrow, 100_000);
+}
+
+#[test]
+fn test_fund_allowed_when_unpaused() {
+    let state = unpaused_state();
+    let mut escrow = default_escrow();
+    EscrowContract::fund(&state, &mut escrow, 500_000);
+    assert_eq!(escrow.funded_amount, 500_000);
+}
 
     assert_eq!(escrow.version, SCHEMA_VERSION);
     assert_eq!(client.get_version(), SCHEMA_VERSION);
@@ -976,4 +1118,21 @@ fn test_full_funding_updates_status() {
     
     let escrow = client.get_escrow();
     assert_eq!(escrow.status, 1); // Status 1 = Funded
+}
+
+/// Read-only methods are never blocked by pause state.
+#[test]
+fn test_read_only_methods_unaffected_by_pause() {
+    let env = Env::default();
+    let state = paused_state();
+
+    let v = EscrowContract::version(&env).to_string();
+    assert!(!v.is_empty());
+
+    let paused = EscrowContract::is_paused(&state);
+    assert!(paused);
+
+    let escrow = default_escrow();
+    let read = EscrowContract::get_escrow(&escrow);
+    assert_eq!(read.invoice_id, 42);
 }

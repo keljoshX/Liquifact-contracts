@@ -225,7 +225,7 @@ impl LiquifactEscrow {
         sme_address: Address,
         admin: Address,
         amount: i128,
-        yield_bps: i64,
+        yield_bps: u32,
         maturity: u64,
         funding_deadline: u64, // NEW
     ) -> InvoiceEscrow {
@@ -465,5 +465,8 @@ impl LiquifactEscrow {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests live in a separate module, following Soroban convention.
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod test;
